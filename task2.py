@@ -7,12 +7,10 @@ import missingno as msno
 
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import Ridge
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.model_selection import KFold
 from sklearn.impute import SimpleImputer
-from sklearn.base import clone
-from sklearn.utils import resample
 
 TRAIN_PATH = "train_data.csv"
 TEST_PATH = "test_data.csv"
@@ -27,14 +25,19 @@ PLOT_DIR = "plots_task2"
 SUMMARY_CSV = "task2_cv_summary.csv"
 os.makedirs(PLOT_DIR, exist_ok=True)
 
-ENABLE_SELF_TRAINING = True
-SELF_TRAIN_MAX_ITERS = 3
-SELF_TRAIN_ADD_FRACTION = 0.10
-BOOTSTRAP_ENSEMBLE_SIZE = 7
+# Semi-supervised disabled (we removed self-training in the clean version)
+ENABLE_SELF_TRAINING = False
+
+# Hyperparameters / settings
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
 
 def error_metric(y, y_hat, c):
+    """
+    censored Mean Squared Error (cMSE):
+      - for uncensored (c==0): (y - y_hat)^2
+      - for censored   (c==1): max(0, y - y_hat)^2  (no penalty if y_hat >= y)
+    """
     y = np.asarray(y)
     y_hat = np.asarray(y_hat)
     c = np.asarray(c).astype(int)
@@ -124,8 +127,8 @@ def preprocess_features(train_df, test_df):
     X_train = pd.concat([t_num, t_cat], axis=1)
     X_test = pd.concat([s_num, s_cat], axis=1)
 
+    # Align test to train (one-directional)
     X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
-    X_train = X_train.reindex(columns=X_test.columns, fill_value=0)
 
     X_train = X_train.reset_index(drop=True)
     X_train.insert(0, ID_COL, t[ID_COL].reset_index(drop=True))
@@ -186,11 +189,11 @@ def cv_evaluate_pipeline(pipeline, X, y, c, kfold, labeled_indices):
 
     return fold_errors, oof_preds
 
-def make_polynomial_pipeline(degree):
+def make_polynomial_pipeline(degree, alpha=1.0):
     return Pipeline([
         ("poly", PolynomialFeatures(degree=degree, include_bias=False)),
         ("scaler", StandardScaler()),
-        ("lr", LinearRegression())
+        ("ridge", Ridge(alpha=alpha))
     ])
 
 def make_knn_pipeline(k):
@@ -199,108 +202,135 @@ def make_knn_pipeline(k):
         ("knn", KNeighborsRegressor(n_neighbors=k))
     ])
 
-def bootstrap_ensemble_predictions(base_pipeline, X_labeled, y_labeled, X_unlabeled, n_estimators=BOOTSTRAP_ENSEMBLE_SIZE, random_state=RANDOM_STATE):
-    rng = np.random.RandomState(random_state)
-    preds_collection = []
-    for i in range(n_estimators):
-        Xb, yb = resample(X_labeled, y_labeled, replace=True, random_state=rng.randint(0, 1_000_000))
-        p = clone(base_pipeline)
-        p.fit(Xb, yb)
-        preds_collection.append(p.predict(X_unlabeled))
-    preds = np.vstack(preds_collection)
-    return preds.mean(axis=0), preds.std(axis=0)
 
-def self_training_pipeline(base_pipeline, X_all, y_all, c_all, labeled_mask, unlabeled_mask,max_iters=SELF_TRAIN_MAX_ITERS, add_fraction=SELF_TRAIN_ADD_FRACTION):
-    labeled_idx = list(np.where(labeled_mask)[0])
-    unlabeled_idx = list(np.where(unlabeled_mask)[0])
-
-    X = X_all
-    y = y_all.copy()
-    c = c_all.copy()
-
-    if len(unlabeled_idx) == 0:
-        base_pipeline.fit(X.iloc[labeled_idx], y[labeled_idx])
-        return base_pipeline, X, y, c
-
-    pipeline = clone(base_pipeline)
-    for it in range(max_iters):
-        pipeline.fit(X.iloc[labeled_idx], y[labeled_idx])
-        if len(unlabeled_idx) == 0:
-            break
-        X_unl = X.iloc[unlabeled_idx]
-        preds_mean, preds_std = bootstrap_ensemble_predictions(pipeline, X.iloc[labeled_idx], y[labeled_idx], X_unl)
-
-        n_add = max(1, int(len(unlabeled_idx) * add_fraction))
-        pick_local = np.argsort(preds_std)[:n_add]
-        pick_global = [unlabeled_idx[i] for i in pick_local]
-
-        for pl, pg in zip(pick_local, pick_global):
-            y[pg] = float(preds_mean[pl])
-            c[pg] = 0 
-            labeled_idx.append(pg)
-
-        unlabeled_idx = [idx for idx in unlabeled_idx if idx not in pick_global]
-        print(f" Self-train iter {it+1}: added {len(pick_global)} pseudo-labels; unlabeled left {len(unlabeled_idx)}")
-
-    pipeline.fit(X.iloc[labeled_idx], y[labeled_idx])
-    print("Self-training finished. Final labeled count:", len(labeled_idx))
-    return pipeline, X, y, c
-
-def run_model_selection(X, y, c, labeled_mask, cv_splits=5, poly_degrees=(1,2,3), knn_neighbors=(3,5,7,9)):
+def run_model_selection(X, y, c, labeled_mask, cv_splits=5,
+                        poly_degrees=(1,2,3),
+                        ridge_alphas=(0.1, 1.0, 10.0, 50.0),
+                        knn_neighbors=(3,5,7,9,15)):
+    """
+    Cross-validate polynomial(Ridge) variants and KNN variants.
+    Returns results list (dictionaries) and a summary_df sorted by mean_error.
+    """
     labeled_indices = np.where(labeled_mask)[0]
     kf = KFold(n_splits=cv_splits, shuffle=True, random_state=RANDOM_STATE)
+
     results = []
 
+    # Ridge polynomial models
     for deg in poly_degrees:
-        pipe = make_polynomial_pipeline(deg)
-        fold_errors, _ = cv_evaluate_pipeline(pipe, X, y, c, kf, labeled_indices)
-        results.append(dict(model="polynomial", param=deg, fold_errors=fold_errors,
-                            mean_error=np.mean(fold_errors), std_error=np.std(fold_errors),
-                            min_error=np.min(fold_errors), max_error=np.max(fold_errors)))
+        for alpha in ridge_alphas:
+            pipe = make_polynomial_pipeline(deg, alpha)
+            fold_errors = []
+
+            for tr_loc, te_loc in kf.split(labeled_indices):
+                tr = labeled_indices[tr_loc]
+                te = labeled_indices[te_loc]
+
+                pipe.fit(X.iloc[tr], y[tr])
+                preds = pipe.predict(X.iloc[te])
+                err = error_metric(y[te], preds, c[te])
+                fold_errors.append(err)
+
+            results.append({
+                "model": "polynomial",
+                "degree": deg,
+                "alpha": alpha,
+                "mean_error": np.mean(fold_errors),
+                "std_error": np.std(fold_errors),
+                "fold_errors": fold_errors
+            })
+            print(f"[CV] poly deg={deg}, alpha={alpha}, mean={np.mean(fold_errors):.4f}")
+
+    # KNN models
     for k in knn_neighbors:
         pipe = make_knn_pipeline(k)
-        fold_errors, _ = cv_evaluate_pipeline(pipe, X, y, c, kf, labeled_indices)
-        results.append(dict(model="knn", param=k, fold_errors=fold_errors,
-                            mean_error=np.mean(fold_errors), std_error=np.std(fold_errors),
-                            min_error=np.min(fold_errors), max_error=np.max(fold_errors)))
-    rows = [{"model": r["model"], "param": r["param"], "mean_error": r["mean_error"], "std_error": r["std_error"],
-             "min_error": r["min_error"], "max_error": r["max_error"]} for r in results]
-    summary_df = pd.DataFrame(rows).sort_values(by=["mean_error", "std_error"]).reset_index(drop=True)
+        fold_errors = []
+
+        for tr_loc, te_loc in kf.split(labeled_indices):
+            tr = labeled_indices[tr_loc]
+            te = labeled_indices[te_loc]
+
+            pipe.fit(X.iloc[tr], y[tr])
+            preds = pipe.predict(X.iloc[te])
+            err = error_metric(y[te], preds, c[te])
+            fold_errors.append(err)
+
+        results.append({
+            "model": "knn",
+            "k": k,
+            "mean_error": np.mean(fold_errors),
+            "std_error": np.std(fold_errors),
+            "fold_errors": fold_errors
+        })
+        print(f"[CV] knn k={k}, mean={np.mean(fold_errors):.4f}")
+
+    # Build summary
+    summary_rows = []
+    for r in results:
+        if r["model"] == "polynomial":
+            param_str = f"deg={r['degree']}, alpha={r['alpha']}"
+        else:
+            param_str = f"k={r['k']}"
+
+        summary_rows.append({
+            "model": r["model"],
+            "param": param_str,
+            "mean_error": r["mean_error"],
+            "std_error": r["std_error"],
+            "min_error": np.min(r["fold_errors"]),
+            "max_error": np.max(r["fold_errors"])
+        })
+
+    summary_df = pd.DataFrame(summary_rows).sort_values(
+        by=["mean_error", "std_error"]
+    ).reset_index(drop=True)
+
     summary_df.to_csv(SUMMARY_CSV, index=False)
     print("Saved CV summary:", SUMMARY_CSV)
+
     return results, summary_df
 
 def select_best_model_from_summary(results):
+    """Return the dictionary entry from results with smallest mean_error (then std)."""
     return min(results, key=lambda r: (r["mean_error"], r["std_error"]))
 
-def train_final_and_generate_submission(best_entry, X, y, c, X_test_df, sample_sub, out_filename=OUT_SUBMISSION):
+def train_final_and_generate_submission(best_entry, X, y, c, X_test_df, sample_sub, out_filename):
+    """
+    Train the selected best_entry on ALL labeled data and generate a Kaggle-style submission.
+    best_entry is an element from results returned by run_model_selection.
+    """
+    # Build best model
     if best_entry["model"] == "polynomial":
-        final_pipe = make_polynomial_pipeline(best_entry["param"])
+        pipe = make_polynomial_pipeline(best_entry["degree"], best_entry["alpha"])
     else:
-        final_pipe = make_knn_pipeline(best_entry["param"])
+        pipe = make_knn_pipeline(best_entry["k"])
 
-    train_mask = ~pd.isna(y)
-    final_pipe.fit(X.loc[train_mask, :], y[train_mask])
+    # Train only on labeled data
+    labeled = ~pd.isna(y)
+    pipe.fit(X.loc[labeled], y[labeled])
 
-    train_preds = final_pipe.predict(X.loc[train_mask, :])
-    train_err = error_metric(y[train_mask], train_preds, c[train_mask])
+    # Report training cMSE
+    preds_train = pipe.predict(X.loc[labeled])
+    train_err = error_metric(y[labeled], preds_train, c[labeled])
     print("Final train cMSE:", train_err)
 
-    Xt = X_test_df.copy()
-    if ID_COL in Xt.columns:
-        Xt = Xt.drop(columns=[ID_COL])
-    test_preds = final_pipe.predict(Xt)
+    # Predict test
+    Xt = X_test_df.drop(columns=[ID_COL], errors="ignore")
+    test_preds = pipe.predict(Xt)
 
+    # Write submission
     sub = sample_sub.copy()
-    cols = sub.columns.tolist()
-    if len(cols) >= 2:
-        sub[cols[1]] = test_preds
+    if sub.shape[1] >= 2:
+        target_col = sub.columns[1]
+        sub[target_col] = test_preds
     else:
+        # fallback: create proper submission with ID and target
         ids = sub[ID_COL].values if ID_COL in sub.columns else np.arange(len(test_preds))
         sub = pd.DataFrame({ID_COL: ids, TARGET_COL: test_preds})
+
     sub.to_csv(out_filename, index=False)
     print("Saved submission:", out_filename)
-    return final_pipe, train_err
+    return pipe, train_err
 
 def plot_cv_summary(summary_df):
     plt.figure(figsize=(8,5))
@@ -365,18 +395,24 @@ def main():
 
     X_all, y_all, c_all, labeled_mask, unlabeled_mask = prepare_X_y_c(train_df, X_train_pre)
 
+    # Model selection and hyperparameter ranges
     poly_degrees = (1,2,3)
     knn_neighbors = (3,5,7,9)
-    results, summary_df = run_model_selection(X_all, y_all, c_all, labeled_mask, cv_splits=5, poly_degrees=poly_degrees, knn_neighbors=knn_neighbors)
-    best = select_best_model_from_summary(results)
-    print("Best model:", best)
 
-    if ENABLE_SELF_TRAINING:
-        print("Starting self-training...")
-        base_pipe = make_polynomial_pipeline(best["param"]) if best["model"]=="polynomial" else make_knn_pipeline(best["param"])
-        trained_pipe, X_aug, y_aug, c_aug = self_training_pipeline(base_pipe, X_all, y_all, c_all, labeled_mask, unlabeled_mask, max_iters=SELF_TRAIN_MAX_ITERS, add_fraction=SELF_TRAIN_ADD_FRACTION)
-    else:
-        X_aug, y_aug, c_aug = X_all, y_all, c_all
+    results, summary_df = run_model_selection(
+        X_all, y_all, c_all, labeled_mask,
+        cv_splits=5,
+        poly_degrees=poly_degrees,
+        ridge_alphas=(0.1, 1.0, 10.0, 50.0),
+        knn_neighbors=knn_neighbors
+    )
+
+    best = select_best_model_from_summary(results)
+    print("Summary_df:", summary_df)
+    print("Best model (selected):", best)
+
+    # We disabled self-training in the clean version; use X_all/y_all as is
+    X_aug, y_aug, c_aug = X_all, y_all, c_all
 
     submission_path = get_next_submission_filename(
         task_num=2,
