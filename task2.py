@@ -25,19 +25,13 @@ PLOT_DIR = "plots_task2"
 SUMMARY_CSV = "task2_cv_summary.csv"
 os.makedirs(PLOT_DIR, exist_ok=True)
 
-# Semi-supervised disabled (we removed self-training in the clean version)
 ENABLE_SELF_TRAINING = False
 
-# Hyperparameters / settings
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
 
+# implements censored Mean Squared Error
 def error_metric(y, y_hat, c):
-    """
-    censored Mean Squared Error (cMSE):
-      - for uncensored (c==0): (y - y_hat)^2
-      - for censored   (c==1): max(0, y - y_hat)^2  (no penalty if y_hat >= y)
-    """
     y = np.asarray(y)
     y_hat = np.asarray(y_hat)
     c = np.asarray(c).astype(int)
@@ -45,6 +39,7 @@ def error_metric(y, y_hat, c):
     err = (1 - c) * (err ** 2) + c * (np.maximum(0, err) ** 2)
     return np.sum(err) / err.shape[0]
 
+# Identifies the patient ID column in a given dataframe
 def find_id_col(df):
     candidates = [ID_COL, "id", "ID", "patient_id", "PatientID", "Unnamed: 0", "index"]
     for c in candidates:
@@ -52,12 +47,14 @@ def find_id_col(df):
             return c
     return None
 
+# Load .csv data files (train, test and sample)
 def load_data(train_path, test_path, sample_path):
     train = pd.read_csv(train_path)
     test = pd.read_csv(test_path)
     sample = pd.read_csv(sample_path)
     return train, test, sample
 
+# Standardize the patient ID column name across datasets
 def standardize_id_names(train_df, test_df, sample_df):
     df_tr = train_df
     df_te = test_df
@@ -79,6 +76,7 @@ def standardize_id_names(train_df, test_df, sample_df):
             df_s = df_s.rename(columns={found: ID_COL})
     return df_tr, df_te, df_s
 
+#Creates plots to visualize patterns such as missing data
 def produce_missingness_plots(train_df, out_dir=PLOT_DIR):
     plt.figure(figsize=(10,4)); msno.bar(train_df); plt.title("Missing values - bar"); plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "missing_bar.png")); plt.close()
@@ -89,6 +87,7 @@ def produce_missingness_plots(train_df, out_dir=PLOT_DIR):
     except Exception as e:
         print("dendrogram skipped:", e)
 
+# 
 def preprocess_features(train_df, test_df):
     t = train_df.copy()
     s = test_df.copy()
@@ -127,7 +126,6 @@ def preprocess_features(train_df, test_df):
     X_train = pd.concat([t_num, t_cat], axis=1)
     X_test = pd.concat([s_num, s_cat], axis=1)
 
-    # Align test to train (one-directional)
     X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
 
     X_train = X_train.reset_index(drop=True)
@@ -138,6 +136,7 @@ def preprocess_features(train_df, test_df):
     print("Preprocessing features done. Shapes:", X_train.shape, X_test.shape)
     return X_train, X_test, X_train.columns.tolist()
 
+# Align x (features only) with y (survival time array) and c (censoring indicator)
 def prepare_X_y_c(train_df, X_train_df):
     if ID_COL not in X_train_df.columns:
         raise ValueError("X_train_df must include ID_COL as a column for safe alignment.")
@@ -166,6 +165,7 @@ def prepare_X_y_c(train_df, X_train_df):
     print("prepare_X_y_c: n_rows =", len(X), "labeled =", labeled_mask.sum(), "unlabeled =", unlabeled_mask.sum())
     return X.reset_index(drop=True), y, c, labeled_mask, unlabeled_mask
 
+# Runs KFold CV for a given pipeline, returning fold errors and out of fold predictions
 def cv_evaluate_pipeline(pipeline, X, y, c, kfold, labeled_indices):
     labeled_indices = np.asarray(labeled_indices)
     n = len(labeled_indices)
@@ -189,6 +189,7 @@ def cv_evaluate_pipeline(pipeline, X, y, c, kfold, labeled_indices):
 
     return fold_errors, oof_preds
 
+# Polynomial pipeline
 def make_polynomial_pipeline(degree, alpha=1.0):
     return Pipeline([
         ("poly", PolynomialFeatures(degree=degree, include_bias=False)),
@@ -196,27 +197,20 @@ def make_polynomial_pipeline(degree, alpha=1.0):
         ("ridge", Ridge(alpha=alpha))
     ])
 
+# KNN pipeline
 def make_knn_pipeline(k):
     return Pipeline([
         ("scaler", StandardScaler()),
         ("knn", KNeighborsRegressor(n_neighbors=k))
     ])
 
-
-def run_model_selection(X, y, c, labeled_mask, cv_splits=5,
-                        poly_degrees=(1,2,3),
-                        ridge_alphas=(0.1, 1.0, 10.0, 50.0),
-                        knn_neighbors=(3,5,7,9,15)):
-    """
-    Cross-validate polynomial(Ridge) variants and KNN variants.
-    Returns results list (dictionaries) and a summary_df sorted by mean_error.
-    """
+# Obtain different models to be chosen later
+def run_model_selection(X, y, c, labeled_mask, cv_splits=5,poly_degrees=(1,2,3),ridge_alphas=(0.1, 1.0, 10.0, 50.0),knn_neighbors=(3,5,7,9,15)):
     labeled_indices = np.where(labeled_mask)[0]
     kf = KFold(n_splits=cv_splits, shuffle=True, random_state=RANDOM_STATE)
 
     results = []
 
-    # Ridge polynomial models
     for deg in poly_degrees:
         for alpha in ridge_alphas:
             pipe = make_polynomial_pipeline(deg, alpha)
@@ -241,7 +235,6 @@ def run_model_selection(X, y, c, labeled_mask, cv_splits=5,
             })
             print(f"[CV] poly deg={deg}, alpha={alpha}, mean={np.mean(fold_errors):.4f}")
 
-    # KNN models
     for k in knn_neighbors:
         pipe = make_knn_pipeline(k)
         fold_errors = []
@@ -264,7 +257,6 @@ def run_model_selection(X, y, c, labeled_mask, cv_splits=5,
         })
         print(f"[CV] knn k={k}, mean={np.mean(fold_errors):.4f}")
 
-    # Build summary
     summary_rows = []
     for r in results:
         if r["model"] == "polynomial":
@@ -290,41 +282,32 @@ def run_model_selection(X, y, c, labeled_mask, cv_splits=5,
 
     return results, summary_df
 
+# Select the best model based on mean and std error
 def select_best_model_from_summary(results):
-    """Return the dictionary entry from results with smallest mean_error (then std)."""
     return min(results, key=lambda r: (r["mean_error"], r["std_error"]))
 
+# Train final model on all labeled data and generate submission file
 def train_final_and_generate_submission(best_entry, X, y, c, X_test_df, sample_sub, out_filename):
-    """
-    Train the selected best_entry on ALL labeled data and generate a Kaggle-style submission.
-    best_entry is an element from results returned by run_model_selection.
-    """
-    # Build best model
     if best_entry["model"] == "polynomial":
         pipe = make_polynomial_pipeline(best_entry["degree"], best_entry["alpha"])
     else:
         pipe = make_knn_pipeline(best_entry["k"])
 
-    # Train only on labeled data
     labeled = ~pd.isna(y)
     pipe.fit(X.loc[labeled], y[labeled])
 
-    # Report training cMSE
     preds_train = pipe.predict(X.loc[labeled])
     train_err = error_metric(y[labeled], preds_train, c[labeled])
     print("Final train cMSE:", train_err)
 
-    # Predict test
     Xt = X_test_df.drop(columns=[ID_COL], errors="ignore")
     test_preds = pipe.predict(Xt)
 
-    # Write submission
     sub = sample_sub.copy()
     if sub.shape[1] >= 2:
         target_col = sub.columns[1]
         sub[target_col] = test_preds
     else:
-        # fallback: create proper submission with ID and target
         ids = sub[ID_COL].values if ID_COL in sub.columns else np.arange(len(test_preds))
         sub = pd.DataFrame({ID_COL: ids, TARGET_COL: test_preds})
 
@@ -332,6 +315,7 @@ def train_final_and_generate_submission(best_entry, X, y, c, X_test_df, sample_s
     print("Saved submission:", out_filename)
     return pipe, train_err
 
+# Plot CV summary
 def plot_cv_summary(summary_df):
     plt.figure(figsize=(8,5))
     s = summary_df.copy()
@@ -342,6 +326,7 @@ def plot_cv_summary(summary_df):
     fn = os.path.join(PLOT_DIR, "cv_mean_errors.png")
     plt.savefig(fn); plt.close(); print("Saved:", fn)
 
+# Plot y vs yhat
 def plot_y_vs_yhat(y_true, y_pred, out_path):
     plt.figure(figsize=(6,6))
     plt.scatter(y_true, y_pred, alpha=0.5)
@@ -350,6 +335,7 @@ def plot_y_vs_yhat(y_true, y_pred, out_path):
     plt.plot([mn, mx], [mn, mx], 'k--')
     plt.savefig(out_path); plt.close(); print("Saved:", out_path)
     
+# Aux method to obtain the next submission filename
 def get_next_submission_filename(task_num, base_name):
     folder = f"submissions_task_{task_num}"
     os.makedirs(folder, exist_ok=True)
@@ -395,7 +381,6 @@ def main():
 
     X_all, y_all, c_all, labeled_mask, unlabeled_mask = prepare_X_y_c(train_df, X_train_pre)
 
-    # Model selection and hyperparameter ranges
     poly_degrees = (1,2,3)
     knn_neighbors = (3,5,7,9)
 
@@ -411,7 +396,6 @@ def main():
     print("Summary_df:", summary_df)
     print("Best model (selected):", best)
 
-    # We disabled self-training in the clean version; use X_all/y_all as is
     X_aug, y_aug, c_aug = X_all, y_all, c_all
 
     submission_path = get_next_submission_filename(
